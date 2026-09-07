@@ -1,7 +1,11 @@
 import subprocess, sys
 # install requests if missing
-subprocess.check_call([sys.executable, "-m", "pip", "install", "requests", "-q"])
-import requests, sqlite3, os, re, json, random
+try:
+    import requests
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests", "-q"])
+    import requests
+import sqlite3, os, re, json, random
 from datetime import datetime
 from html.parser import HTMLParser
 
