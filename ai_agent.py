@@ -1,10 +1,13 @@
 import subprocess, sys
+# install requests if missing
 subprocess.check_call([sys.executable, "-m", "pip", "install", "requests", "-q"])
 import requests, sqlite3, os
 from datetime import datetime
 from html.parser import HTMLParser
 
-DB_PATH = os.path.expanduser("~/Desktop/AIAgent/jimmy_memory.db")
+# Database path: default to a file in the user's home directory
+DB_PATH = os.path.expanduser("~/.jimmy_memory.db")
+
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -25,11 +28,13 @@ def init_db():
     conn.commit()
     return conn
 
+
 def save_knowledge(conn, topic, fact, source):
     c = conn.cursor()
     c.execute("INSERT INTO knowledge (timestamp, topic, fact, source) VALUES (?, ?, ?, ?)",
               (datetime.now().isoformat(), topic, fact, source))
     conn.commit()
+
 
 def save_conversation(conn, question, answer):
     c = conn.cursor()
@@ -37,81 +42,92 @@ def save_conversation(conn, question, answer):
               (datetime.now().isoformat(), question, answer))
     conn.commit()
 
+
 def recall_knowledge(conn, topic):
     c = conn.cursor()
     c.execute("SELECT fact, source, timestamp FROM knowledge WHERE topic LIKE ? ORDER BY timestamp DESC LIMIT 5",
               (f"%{topic}%",))
     return c.fetchall()
 
+
 def list_topics(conn):
     c = conn.cursor()
     c.execute("SELECT DISTINCT topic FROM knowledge ORDER BY topic")
     return [row[0] for row in c.fetchall()]
 
+
 class LinkExtractor(HTMLParser):
+    """Very small HTML parser to extract titles/snippets from DuckDuckGo's simple HTML result page.
+    This is intentionally forgiving rather than strictly tied to exact tag/class combinations.
+    """
     def __init__(self):
         super().__init__()
-        self.in_result = False
-        self.in_snippet = False
         self.results = []
-        self.current_title = ""
-        self.current_snippet = ""
+        self._capture = None
+        self._current = {"title": "", "snippet": ""}
 
     def handle_starttag(self, tag, attrs):
-        attrs_dict = dict(attrs)
-        cls = attrs_dict.get("class", "")
-        if tag == "a" and cls == "result__a":
-            self.in_result = True
-            self.current_title = ""
-        if tag == "a" and cls == "result__snippet":
-            self.in_snippet = True
-            self.current_snippet = ""
+        attrs = dict(attrs)
+        cls = attrs.get("class", "")
+        # Titles often use 'result__a' class; snippets may be in a span/div with 'result__snippet' or similar
+        if tag == "a" and "result__a" in cls:
+            self._capture = "title"
+            self._current["title"] = ""
+        elif tag in ("a", "div", "span") and "result__snippet" in cls:
+            self._capture = "snippet"
+            self._current["snippet"] = ""
 
     def handle_data(self, data):
-        if self.in_result:
-            self.current_title += data
-        if self.in_snippet:
-            self.current_snippet += data
+        if not self._capture:
+            return
+        self._current[self._capture] += data
 
     def handle_endtag(self, tag):
-        if tag == "a" and self.in_result:
-            self.in_result = False
-        if tag == "a" and self.in_snippet:
-            self.in_snippet = False
-            if self.current_title.strip():
-                self.results.append({
-                    "title": self.current_title.strip(),
-                    "snippet": self.current_snippet.strip()
-                })
+        # end of a result entry: when we finish a snippet, treat that as one result if title exists
+        if self._capture:
+            self._capture = None
+            if self._current.get("title") or self._current.get("snippet"):
+                # only append if we have something meaningful
+                title = self._current.get("title", "").strip()
+                snippet = self._current.get("snippet", "").strip()
+                if title or snippet:
+                    self.results.append({"title": title or "(no title)", "snippet": snippet})
+                self._current = {"title": "", "snippet": ""}
+
 
 def research_topic(topic):
     try:
-        r = requests.get(f"https://duckduckgo.com/html/?q={topic}",
-                          headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        # DuckDuckGo's HTML endpoint works reasonably for simple scraping
+        r = requests.get(f"https://duckduckgo.com/html/?q={requests.utils.quote(topic)}",
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
         parser = LinkExtractor()
         parser.feed(r.text)
         return parser.results[:5]
-    except Exception as e:
+    except Exception:
         return []
+
 
 def learn(conn, topic):
     print(f"Jimmy is researching: {topic}...")
     results = research_topic(topic)
     if not results:
         print("Jimmy could not find anything on that topic.")
-        return
+        return 0
 
     learned_count = 0
     for item in results:
-        if item["snippet"]:
-            save_knowledge(conn, topic, item["snippet"], item["title"])
+        if item.get("snippet"):
+            save_knowledge(conn, topic, item["snippet"], item.get("title", "unknown"))
             learned_count += 1
 
     print(f"Jimmy learned {learned_count} new facts about '{topic}'.")
-    print("Here is a summary of what Jimmy found:\n")
-    for item in results:
-        if item["snippet"]:
-            print(f"- {item['snippet']} (source: {item['title']})")
+    if learned_count:
+        print("Here is a summary of what Jimmy found:\n")
+        for item in results:
+            if item.get("snippet"):
+                print(f"- {item['snippet']} (source: {item.get('title', 'unknown')})")
+    return learned_count
+
 
 def show_knowledge(conn, topic):
     facts = recall_knowledge(conn, topic)
@@ -122,6 +138,7 @@ def show_knowledge(conn, topic):
     for fact, source, ts in facts:
         print(f"- {fact} (source: {source})")
 
+
 def main():
     conn = init_db()
     print("\n=== Jimmy is online ===")
@@ -131,17 +148,47 @@ def main():
     print("  topics             -> list everything Jimmy has learned about")
     print("  exit               -> quit\n")
 
-    while True:
-        q = input("You: ").strip()
-        if not q:
-            continue
-        ql = q.lower()
+    try:
+        while True:
+            try:
+                q = input("You: ").strip()
+            except EOFError:
+                break
+            if not q:
+                continue
+            ql = q.lower()
 
-        if ql == "exit":
-            break
+            if ql == "exit":
+                break
 
-        elif ql.startswith("learn "):
-            topic = q[6:].strip()
-            learn(conn, topic)
-            save_con
+            elif ql.startswith("learn "):
+                topic = q[6:].strip()
+                learned = learn(conn, topic)
+                save_conversation(conn, f"learn {topic}", f"learned {learned} facts")
 
+            elif ql.startswith("what do you know about "):
+                topic = q[len("what do you know about "):].strip()
+                show_knowledge(conn, topic)
+                save_conversation(conn, f"what do you know about {topic}", "recalled knowledge")
+
+            elif ql == "topics":
+                topics = list_topics(conn)
+                if not topics:
+                    print("Jimmy hasn't learned any topics yet.")
+                else:
+                    print("Jimmy knows about these topics:\n")
+                    for t in topics:
+                        print(f"- {t}")
+                save_conversation(conn, "topics", "listed topics")
+
+            else:
+                print("I didn't understand that command. Try: learn <topic>, what do you know about <topic>, topics, or exit")
+
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
